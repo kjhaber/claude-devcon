@@ -36,7 +36,17 @@ check_as_user() {
 echo "=== Cursor image tool checks (${IMAGE}) ==="
 check_as_user "agent runs as non-root" sh -c 'id -u | grep -v "^0$"'
 check "cursor-agent is installed" cursor-agent --version
-check "agent symlink works" agent --version
+check "agent symlink works"       agent --version
+check "git is installed"          git --version
+check "go is installed"           go version
+check "node is installed"         node --version
+check "npm is installed"          npm --version
+check "python3 is installed"      python3 --version
+check "make is installed"         make --version
+check "curl is installed"         curl --version
+check "jq is installed"           jq --version
+check "ripgrep (rg) installed"    rg --version
+check "fzf is installed"          fzf --version
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [[ $FAIL -eq 0 ]]
