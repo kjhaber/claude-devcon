@@ -28,13 +28,20 @@
 PEN_VERSION="%%VERSION%%"
 
 # ---------------------------------------------------------------------------
-# TOML parsing (simple key = "value" only — no sections)
+# TOML parsing (simple key = "value" or key = bare — no sections)
 # ---------------------------------------------------------------------------
 
 _read_toml_str() {
   local file="$1" key="$2"
-  grep -m1 "^${key}[[:space:]]*=" "$file" 2>/dev/null \
-    | sed 's/.*=[[:space:]]*"\(.*\)".*/\1/'
+  local line
+  line=$(grep -m1 "^${key}[[:space:]]*=" "$file" 2>/dev/null) || return 0
+  # Quoted string: key = "value"
+  if [[ "$line" =~ =[[:space:]]*\"(.*)\" ]]; then
+    echo "${BASH_REMATCH[1]}"
+  # Unquoted bare value: key = true / key = 42
+  elif [[ "$line" =~ =[[:space:]]*([^[:space:]#]+) ]]; then
+    echo "${BASH_REMATCH[1]}"
+  fi
 }
 
 # ---------------------------------------------------------------------------
@@ -256,6 +263,42 @@ harness_exec_cmd() {
 # Shared helpers
 # ---------------------------------------------------------------------------
 
+# Emit docker -v args for ~/.gitconfig and any [include] files it references.
+# Included files are mapped to /home/pen/<relative-to-home> so git can find
+# them when it expands ~ inside the container.
+_gitconfig_mount_args() {
+  local gitconfig="${HOME}/.gitconfig"
+  [[ -f "$gitconfig" ]] || return 0
+
+  printf '%s\n' "-v" "${gitconfig}:/home/pen/.gitconfig:ro"
+
+  local in_include=false
+  while IFS= read -r line; do
+    if [[ "$line" =~ ^\[include ]]; then
+      in_include=true
+    elif [[ "$line" =~ ^\[ ]]; then
+      in_include=false
+    elif $in_include && [[ "$line" =~ ^[[:space:]]*path[[:space:]]*=[[:space:]]*(.+)[[:space:]]*$ ]]; then
+      local raw="${BASH_REMATCH[1]}"
+      local host_path="${raw/#\~/$HOME}"
+      local container_path="${raw/#\~//home/pen}"
+      if [[ -f "$host_path" ]]; then
+        printf '%s\n' "-v" "${host_path}:${container_path}:ro"
+      fi
+    fi
+  done < "$gitconfig"
+}
+
+# Emit docker -v arg for the Docker socket when docker_socket=true in .pen.toml
+_docker_socket_args() {
+  local main_wt
+  main_wt=$(main_worktree 2>/dev/null || true)
+  [[ -z "$main_wt" || ! -f "${main_wt}/.pen.toml" ]] && return 0
+  local val
+  val=$(_read_toml_str "${main_wt}/.pen.toml" docker_socket)
+  [[ "$val" == "true" ]] && printf '%s\n' "-v" "/var/run/docker.sock:/var/run/docker.sock"
+}
+
 # Derive a Docker-safe container name from $PWD (pen_ prefix, lowercase, alphanum/underscore/hyphen)
 container_name() {
   local base
@@ -370,9 +413,17 @@ cmd_launch() {
     mount_args+=("-v" "${main_wt}/.git:${main_wt}/.git")
   fi
 
-  # Mount .gitconfig read-only so git identity works inside the container
+  # Mount .gitconfig + any [include] files so git identity works inside the container
   local gitconfig_args=()
-  [[ -f "${HOME}/.gitconfig" ]] && gitconfig_args=("-v" "${HOME}/.gitconfig:/home/pen/.gitconfig:ro")
+  while IFS= read -r arg; do
+    [[ -n "$arg" ]] && gitconfig_args+=("$arg")
+  done < <(_gitconfig_mount_args)
+
+  # Mount Docker socket when docker_socket=true in .pen.toml
+  local socket_args=()
+  while IFS= read -r arg; do
+    [[ -n "$arg" ]] && socket_args+=("$arg")
+  done < <(_docker_socket_args)
 
   # Collect env args for docker run
   local env_args=()
@@ -391,6 +442,7 @@ cmd_launch() {
     "${env_args[@]}" \
     "${mount_args[@]}" \
     "${gitconfig_args[@]}" \
+    "${socket_args[@]}" \
     -v "${pen_shared_ro}:${pen_shared_ro}:ro" \
     -v "${pen_shared_rw}:${pen_shared_rw}" \
     "${live_mount_args[@]}" \
@@ -600,12 +652,13 @@ cmd_list() {
 }
 
 cmd_init() {
-  local yes=false force=false image=""
+  local yes=false force=false image="" docker_socket=false
   for arg in "$@"; do
     case "$arg" in
-      --yes|-y)   yes=true ;;
-      --force)    force=true ;;
-      --image=*)  image="${arg#--image=}" ;;
+      --yes|-y)        yes=true ;;
+      --force)         force=true ;;
+      --image=*)       image="${arg#--image=}" ;;
+      --docker-socket) docker_socket=true ;;
     esac
   done
 
@@ -666,6 +719,7 @@ cmd_init() {
   {
     printf 'harness = "%s"\n' "$harness"
     [[ -n "$image" ]] && printf 'image = "%s"\n' "$image"
+    $docker_socket && printf 'docker_socket = true\n'
   } > "$toml_file"
   printf 'Wrote %s\n' "$toml_file" >&2
 
@@ -675,7 +729,22 @@ cmd_init() {
     local dockerfile="${pen_dir}/Dockerfile.${harness}"
     _gen_project_dockerfile "$harness" "$image" "$packages" > "$dockerfile"
     printf 'Wrote %s\n' "$dockerfile" >&2
-    printf '\nRun '"'"'pen build'"'"' to build the project image.\n' >&2
+
+    # Auto-build: in --yes mode, build immediately; otherwise ask
+    local do_build=false
+    if $yes; then
+      do_build=true
+    elif [[ -t 0 ]]; then
+      printf '\nBuild the image now? [Y/n] '
+      local r; read -r r
+      [[ -z "$r" || "$r" =~ ^[Yy]$ ]] && do_build=true
+    fi
+
+    if $do_build; then
+      cmd_build || echo "warning: build failed; run 'pen build' to retry" >&2
+    else
+      printf '\nRun '"'"'pen build'"'"' to build the project image.\n' >&2
+    fi
   else
     printf '\nNo extra packages — using default pen-%s:latest.\n' "$harness" >&2
   fi

@@ -44,6 +44,7 @@ check "curl is installed"       curl --version
 check "jq is installed"         jq --version
 check "ripgrep (rg) installed"  rg --version
 check "fzf is installed"        fzf --version
+check "vim is installed"        vim --version
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [[ $FAIL -eq 0 ]]

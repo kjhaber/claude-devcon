@@ -6,6 +6,7 @@ RUN apk add --no-cache \
     jq \
     ca-certificates \
     ripgrep fzf \
+    vim \
     unzip zip
 
 # World-writable home dir for non-root users (host UID passed via --user at runtime)

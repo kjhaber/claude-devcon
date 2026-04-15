@@ -1134,3 +1134,146 @@ EOF
   [ "$status" -eq 0 ]
   [[ "$output" == *"build"* ]]
 }
+
+# ---------------------------------------------------------------------------
+# _read_toml_str — unquoted values (booleans)
+# ---------------------------------------------------------------------------
+
+@test "_read_toml_str: reads unquoted boolean value" {
+  local tmp; tmp=$(mktemp)
+  printf 'docker_socket = true\n' > "$tmp"
+  run _read_toml_str "$tmp" docker_socket
+  [ "$status" -eq 0 ]
+  [ "$output" = "true" ]
+  rm -f "$tmp"
+}
+
+# ---------------------------------------------------------------------------
+# _gitconfig_mount_args
+# ---------------------------------------------------------------------------
+
+@test "_gitconfig_mount_args: emits nothing when .gitconfig absent" {
+  local fake_home; fake_home=$(mktemp -d)
+  HOME="$fake_home" run _gitconfig_mount_args
+  [ "$status" -eq 0 ]
+  [ -z "$output" ]
+  rm -rf "$fake_home"
+}
+
+@test "_gitconfig_mount_args: mounts .gitconfig to /home/pen/.gitconfig" {
+  local fake_home; fake_home=$(mktemp -d)
+  printf '[user]\n    name = Test User\n' > "${fake_home}/.gitconfig"
+  HOME="$fake_home" run _gitconfig_mount_args
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"${fake_home}/.gitconfig:/home/pen/.gitconfig:ro"* ]]
+  rm -rf "$fake_home"
+}
+
+@test "_gitconfig_mount_args: mounts included files at container paths" {
+  local fake_home; fake_home=$(mktemp -d)
+  mkdir -p "${fake_home}/.config-local"
+  printf 'email = work@example.com\n' > "${fake_home}/.config-local/gitconfig"
+  printf '[include]\n    path = ~/.config-local/gitconfig\n' > "${fake_home}/.gitconfig"
+  HOME="$fake_home" run _gitconfig_mount_args
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"${fake_home}/.config-local/gitconfig:/home/pen/.config-local/gitconfig:ro"* ]]
+  rm -rf "$fake_home"
+}
+
+@test "_gitconfig_mount_args: skips include paths that do not exist on host" {
+  local fake_home; fake_home=$(mktemp -d)
+  printf '[include]\n    path = ~/.nonexistent-config\n' > "${fake_home}/.gitconfig"
+  HOME="$fake_home" run _gitconfig_mount_args
+  [ "$status" -eq 0 ]
+  [[ "$output" != *"nonexistent"* ]]
+  rm -rf "$fake_home"
+}
+
+# ---------------------------------------------------------------------------
+# cmd_launch: gitconfig include mounts
+# ---------------------------------------------------------------------------
+
+@test "cmd_launch: mounts gitconfig include files into container" {
+  local fake_home; fake_home=$(mktemp -d)
+  _setup_fake_home "$fake_home"
+  mkdir -p "${fake_home}/.config-local"
+  printf 'email = work@example.com\n' > "${fake_home}/.config-local/gitconfig"
+  printf '[include]\n    path = ~/.config-local/gitconfig\n' > "${fake_home}/.gitconfig"
+  _mock_docker_new
+  HOME="$fake_home" HARNESS_CONFIG="${fake_home}/.pen/container-shared/rw/claude" run cmd_launch
+  local run_args; run_args=$(cat "${MOCK_BIN}/.docker_run_log" 2>/dev/null)
+  [[ "$run_args" == *"${fake_home}/.config-local/gitconfig:/home/pen/.config-local/gitconfig:ro"* ]]
+  rm -rf "$fake_home"
+}
+
+# ---------------------------------------------------------------------------
+# cmd_launch: docker socket mount
+# ---------------------------------------------------------------------------
+
+@test "cmd_launch: mounts docker socket when docker_socket=true in .pen.toml" {
+  local fake_home; fake_home=$(mktemp -d)
+  local main_wt; main_wt=$(mktemp -d)
+  printf 'docker_socket = true\n' > "${main_wt}/.pen.toml"
+  cat > "${MOCK_BIN}/git" << EOF
+#!/usr/bin/env bash
+printf '%s abc1234 [main]\n' "$main_wt"
+EOF
+  chmod +x "${MOCK_BIN}/git"
+  _setup_fake_home "$fake_home"
+  _mock_docker_new
+  HOME="$fake_home" HARNESS_CONFIG="${fake_home}/.pen/container-shared/rw/claude" run cmd_launch
+  local run_args; run_args=$(cat "${MOCK_BIN}/.docker_run_log" 2>/dev/null)
+  [[ "$run_args" == *"/var/run/docker.sock:/var/run/docker.sock"* ]]
+  rm -rf "$fake_home" "$main_wt"
+}
+
+@test "cmd_launch: does not mount docker socket when docker_socket unset" {
+  local fake_home; fake_home=$(mktemp -d)
+  cat > "${MOCK_BIN}/git" << 'EOF'
+#!/usr/bin/env bash
+exit 1
+EOF
+  chmod +x "${MOCK_BIN}/git"
+  _setup_fake_home "$fake_home"
+  _mock_docker_new
+  HOME="$fake_home" HARNESS_CONFIG="${fake_home}/.pen/container-shared/rw/claude" run cmd_launch
+  local run_args; run_args=$(cat "${MOCK_BIN}/.docker_run_log" 2>/dev/null)
+  [[ "$run_args" != *"docker.sock"* ]]
+  rm -rf "$fake_home"
+}
+
+# ---------------------------------------------------------------------------
+# cmd_init: docker socket flag and auto-build
+# ---------------------------------------------------------------------------
+
+@test "cmd_init: writes docker_socket to .pen.toml when --docker-socket flag set" {
+  local main_wt; main_wt=$(mktemp -d)
+  cat > "${MOCK_BIN}/git" << EOF
+#!/usr/bin/env bash
+printf '%s abc1234 [main]\n' "$main_wt"
+EOF
+  chmod +x "${MOCK_BIN}/git"
+  run cmd_init --yes --docker-socket
+  [ "$status" -eq 0 ]
+  grep -q 'docker_socket = true' "${main_wt}/.pen.toml"
+  rm -rf "$main_wt"
+}
+
+@test "cmd_init: auto-builds image after generating Dockerfile (--yes)" {
+  local main_wt; main_wt=$(mktemp -d)
+  touch "${main_wt}/go.mod"
+  cat > "${MOCK_BIN}/git" << EOF
+#!/usr/bin/env bash
+printf '%s abc1234 [main]\n' "$main_wt"
+EOF
+  chmod +x "${MOCK_BIN}/git"
+  cat > "${MOCK_BIN}/docker" << EOF
+#!/usr/bin/env bash
+echo "docker \$@" >> "${MOCK_BIN}/.docker_log"
+EOF
+  chmod +x "${MOCK_BIN}/docker"
+  HARNESS_IMAGE="pen-claude:latest" run cmd_init --yes
+  [ "$status" -eq 0 ]
+  [[ "$(cat "${MOCK_BIN}/.docker_log" 2>/dev/null)" == *"build"* ]]
+  rm -rf "$main_wt"
+}
